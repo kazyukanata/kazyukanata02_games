@@ -1,0 +1,394 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, updateDoc } from 'firebase/firestore';
+
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'puyo-online-default';
+
+const COLS = 6;
+const ROWS = 12;
+const CELL = 36;
+const COLORS = ["#ff4757", "#2ed573", "#1e90ff", "#ffa502"];
+const OJAMA_COLOR = "#a4b0be";
+const BOMB_COLOR = "#8e44ad";
+const STOPWATCH_COLOR = "#00d2d3";
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [screen, setScreen] = useState('title');
+  const [rooms, setRooms] = useState([]);
+  const [roomId, setRoomId] = useState('');
+  const [roomData, setRoomData] = useState(null);
+  const [inputCode, setInputCode] = useState('');
+  const [countdown, setCountdown] = useState(null);
+
+  // 認証の初期化 (RULE 3 準拠)
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else if (!auth.currentUser) {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth failed:", err);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // 部屋リストの監視 (RULE 1 & 2 準拠)
+  useEffect(() => {
+    if (!user) return;
+    const roomsRef = collection(db, 'artifacts', appId, 'public', 'data', 'rooms');
+    const unsubscribe = onSnapshot(roomsRef, (snapshot) => {
+      let list = [];
+      snapshot.forEach(docSnap => {
+        list.push({ id: docSnap.id, ...docSnap.data() });
+      });
+      setRooms(list);
+    }, (error) => {
+      console.error("Rooms fetch error:", error);
+    });
+    return () => unsubscribe();
+  }, [user]);
+
+  const createRoom = async () => {
+    let currentUser = auth.currentUser;
+    if (!currentUser) {
+      try {
+        const cred = await signInAnonymously(auth);
+        currentUser = cred.user;
+        setUser(currentUser);
+      } catch (e) {
+        alert("認証に失敗しました。もう一度お試しください。");
+        return;
+      }
+    }
+
+    const code = Math.floor(1000 + Math.random() * 9000).toString();
+    const initialBoard = Array(ROWS).fill(null).map(() => Array(COLS).fill(null));
+    const newRoom = {
+      code: code,
+      host: currentUser.uid,
+      status: 'waiting',
+      stopwatch: { active: false, targetUser: null, endTime: 0 },
+      players: {
+        [currentUser.uid]: { name: 'Player ' + currentUser.uid.slice(0, 4), board: initialBoard, score: 0, ready: false, gameOver: false }
+      },
+      createdAt: Date.now()
+    };
+
+    setRoomId(code);
+    setRoomData(newRoom);
+    setScreen('room');
+
+    try {
+      const newRoomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', code);
+      await setDoc(newRoomRef, newRoom);
+    } catch (e) {
+      console.error("Create room firestore error:", e);
+    }
+  };
+
+  const joinRoom = async (targetCode) => {
+    let currentUser = auth.currentUser;
+    if (!currentUser) {
+      try {
+        const cred = await signInAnonymously(auth);
+        currentUser = cred.user;
+        setUser(currentUser);
+      } catch (e) {
+        alert("認証に失敗しました。");
+        return;
+      }
+    }
+
+    const cleanCode = targetCode.trim();
+    if (cleanCode.length !== 4) {
+      alert("4桁のルームコードを入力してください。");
+      return;
+    }
+
+    try {
+      const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', cleanCode);
+      const snap = await getDoc(roomRef);
+      if (!snap.exists()) {
+        alert("指定されたルームコードの部屋が見つかりません。");
+        return;
+      }
+      let data = snap.data();
+      if (data.status !== 'waiting') {
+        alert("このゲームはすでに開始されています。");
+        return;
+      }
+      if (Object.keys(data.players).length >= 4 && !data.players[currentUser.uid]) {
+        alert("ルームが満員です（最大4人）。");
+        return;
+      }
+
+      if (!data.players[currentUser.uid]) {
+        const initialBoard = Array(ROWS).fill(null).map(() => Array(COLS).fill(null));
+        data.players[currentUser.uid] = { name: 'Player ' + currentUser.uid.slice(0, 4), board: initialBoard, score: 0, ready: false, gameOver: false };
+        await updateDoc(roomRef, { players: data.players });
+        // 最新データを反映
+        data.players[currentUser.uid].ready = false;
+      }
+
+      setRoomId(cleanCode);
+      setRoomData(data);
+      setScreen('room');
+    } catch (e) {
+      console.error("Join room error:", e);
+      alert("ルームへの参加に失敗しました。");
+    }
+  };
+
+  useEffect(() => {
+    if (!roomId) return;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    const unsubscribe = onSnapshot(roomRef, async (docSnap) => {
+      if (docSnap.exists()) {
+        let data = docSnap.data();
+        setRoomData(data);
+
+        if (data.status === 'playing' && screen !== 'game') {
+          setScreen('game');
+          return;
+        }
+
+        if (data.status === 'waiting' && screen === 'room') {
+          const playersArr = Object.values(data.players);
+          const allReady = playersArr.length >= 2 && playersArr.every(p => p.ready);
+
+          if (allReady && user && data.host === user.uid) {
+            await updateDoc(roomRef, { status: 'starting' });
+            for (let i = 5; i > 0; i--) {
+              setCountdown(i);
+              await new Promise(r => setTimeout(r, 1000));
+            }
+            setCountdown(null);
+            await updateDoc(roomRef, { status: 'playing' });
+          }
+        }
+      }
+    }, (error) => {
+      console.error("Room sync error:", error);
+    });
+    return () => unsubscribe();
+  }, [roomId, screen, user]);
+
+  const toggleReady = async () => {
+    if (!roomId || !roomData || !user) return;
+    const roomRef = doc(db, 'artifacts', appId, 'public', 'data', 'rooms', roomId);
+    const updatedPlayers = { ...roomData.players };
+    if (updatedPlayers[user.uid]) {
+      updatedPlayers[user.uid].ready = !updatedPlayers[user.uid].ready;
+      await updateDoc(roomRef, { players: updatedPlayers });
+    }
+  };
+
+  return (
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-900 text-white font-sans p-4 relative">
+      {screen === 'title' && (
+        <div className="flex flex-col items-center gap-6 p-8 bg-gray-800 rounded-xl shadow-2xl border border-gray-700 w-80 max-w-full">
+          <h1 className="text-2xl font-bold text-red-500 text-center">ぷよぷよ オンライン対戦</h1>
+          <button 
+            onClick={() => setScreen('lobby')}
+            className="w-full py-3 bg-red-600 hover:bg-red-500 rounded-lg text-lg font-bold shadow-lg transition cursor-pointer"
+          >
+            対戦モードへ
+          </button>
+        </div>
+      )}
+
+      {screen === 'lobby' && (
+        <div className="flex flex-col items-center gap-4 p-6 bg-gray-800 rounded-xl w-96 max-w-full shadow-xl">
+          <h2 className="text-xl font-bold text-yellow-400">ルームメニュー</h2>
+          <button 
+            onClick={createRoom}
+            className="w-full py-3 bg-green-600 hover:bg-green-500 rounded font-bold shadow text-lg cursor-pointer"
+          >
+            新規ルーム作成
+          </button>
+          <button 
+            onClick={() => setScreen('join')}
+            className="w-full py-3 bg-blue-600 hover:bg-blue-500 rounded font-bold shadow text-lg cursor-pointer"
+          >
+            コードでルーム参加
+          </button>
+
+          <div className="w-full mt-4">
+            <h3 className="text-sm text-gray-400 mb-2">公開ルーム一覧</h3>
+            <div className="flex flex-col gap-2 max-h-48 overflow-y-auto bg-gray-900 p-2 rounded">
+              {rooms.filter(r => r.status === 'waiting').length === 0 ? (
+                <p className="text-gray-500 text-xs text-center py-4">現在待機中のルームはありません</p>
+              ) : (
+                rooms.filter(r => r.status === 'waiting').map(r => (
+                  <div key={r.id} className="flex justify-between items-center bg-gray-800 p-2.5 rounded">
+                    <span className="text-sm font-mono text-yellow-300 font-bold">コード: {r.code || r.id}</span>
+                    <span className="text-xs text-gray-400">({Object.keys(r.players).length}/4人)</span>
+                    <button 
+                      onClick={() => joinRoom(r.code || r.id)}
+                      className="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-xs font-bold cursor-pointer"
+                    >
+                      参加
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+          <button onClick={() => setScreen('title')} className="mt-2 text-sm text-gray-400 underline cursor-pointer">
+            タイトルに戻る
+          </button>
+        </div>
+      )}
+
+      {screen === 'join' && (
+        <div className="flex flex-col items-center gap-4 p-6 bg-gray-800 rounded-xl w-96 max-w-full shadow-xl">
+          <h2 className="text-xl font-bold text-yellow-400">ルームに参加</h2>
+          <p className="text-xs text-gray-400">4桁のルームコードを入力してください</p>
+          <input 
+            type="text" 
+            maxLength="4"
+            placeholder="例: 1234" 
+            value={inputCode}
+            onChange={(e) => setInputCode(e.target.value.replace(/[^0-9]/g, ''))}
+            className="w-full p-3 bg-gray-900 border border-gray-700 rounded text-white text-center text-2xl font-mono tracking-widest"
+          />
+          <button 
+            onClick={() => joinRoom(inputCode)}
+            className="w-full py-3 bg-blue-600 hover:bg-blue-500 rounded font-bold shadow cursor-pointer"
+          >
+            参加する
+          </button>
+          <button onClick={() => setScreen('lobby')} className="mt-2 text-sm text-gray-400 underline cursor-pointer">
+            戻る
+          </button>
+        </div>
+      )}
+
+      {screen === 'room' && roomData && (
+        <div className="flex flex-col items-center gap-4 p-6 bg-gray-800 rounded-xl w-96 max-w-full shadow-xl relative">
+          <h2 className="text-xl font-bold text-yellow-400">待機ルーム</h2>
+          <div className="bg-gray-900 px-4 py-2 rounded border border-gray-700 text-center">
+            <span className="text-xs text-gray-400 block">ルームコード</span>
+            <span className="text-3xl font-mono font-bold text-yellow-300 tracking-widest">{roomId}</span>
+          </div>
+
+          {/* 参加しているプレイヤーの一覧（後から入ってきたメンバーが自分の名前の下に追加表示） */}
+          <div className="w-full flex flex-col gap-2">
+            {Object.entries(roomData.players).map(([uid, p]) => (
+              <div key={uid} className="p-3 bg-gray-700 rounded flex justify-between items-center text-sm">
+                <span>{p.name} {uid === user?.uid ? '(あなた)' : ''}</span>
+                <span className={`px-2 py-1 rounded text-xs font-bold ${p.ready ? 'bg-green-600 text-white' : 'bg-gray-600 text-gray-300'}`}>
+                  {p.ready ? '準備OK' : '待機中'}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <p className="text-xs text-gray-400 text-center">
+            {Object.keys(roomData.players).length < 2 
+              ? "※2人以上集まると準備ができるようになります" 
+              : "全員が「準備OK」にすると5秒後に自動スタートします！"}
+          </p>
+
+          <button 
+            onClick={toggleReady}
+            className={`w-full py-3 rounded font-bold shadow transition text-lg cursor-pointer ${roomData.players[user?.uid]?.ready ? 'bg-yellow-600 hover:bg-yellow-500' : 'bg-green-600 hover:bg-green-500'}`}
+          >
+            {roomData.players[user?.uid]?.ready ? '準備を解除する' : '準備OK！'}
+          </button>
+
+          {countdown && (
+            <div className="absolute inset-0 bg-black bg-opacity-80 rounded-xl flex flex-col items-center justify-center animate-pulse">
+              <span className="text-sm text-yellow-400 font-bold mb-2">ゲーム開始まで</span>
+              <span className="text-7xl font-extrabold text-red-500">{countdown}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {screen === 'game' && user && roomId && roomData && (
+        <GameRoom user={user} roomId={roomId} roomData={roomData} db={db} />
+      )}
+    </div>
+  );
+}
+
+function GameRoom({ user, roomId, roomData, db }) {
+  const myCanvasRef = useRef(null);
+  const otherCanvasRefs = useRef({});
+
+  const [stopwatchCountdown, setStopwatchCountdown] = useState(0);
+
+  useEffect(() => {
+    if (!roomData || !roomData.stopwatch) return;
+    const sw = roomData.stopwatch;
+    if (sw.active && sw.targetUser !== user.uid) {
+      let remaining = Math.max(0, Math.ceil((sw.endTime - Date.now()) / 1000));
+      setStopwatchCountdown(remaining);
+
+      const timer = setInterval(() => {
+        let rem = Math.max(0, Math.ceil((sw.endTime - Date.now()) / 1000));
+        setStopwatchCountdown(rem);
+        if (rem <= 0) clearInterval(timer);
+      }, 200);
+
+      return () => clearInterval(timer);
+    } else {
+      setStopwatchCountdown(0);
+    }
+  }, [roomData, user]);
+
+  return (
+    <div className="flex flex-col items-center gap-4 relative">
+      <h2 className="text-xl font-bold text-green-400">オンライン対戦中 (コード: {roomId})</h2>
+      
+      {stopwatchCountdown > 0 && (
+        <div className="absolute inset-0 bg-black bg-opacity-85 z-50 flex flex-col items-center justify-center rounded-xl animate-pulse">
+          <span className="text-red-500 font-bold text-2xl mb-2">⏱ ストップウォッチ発動中！</span>
+          <span className="text-gray-300 text-sm mb-4">他プレイヤーにより操作停止中...</span>
+          <span className="text-8xl font-black text-yellow-400">{stopwatchCountdown}</span>
+        </div>
+      )}
+
+      <div className="flex flex-row gap-4 items-start">
+        <div className="flex flex-col items-center">
+          <span className="text-xs text-gray-300 mb-1">自分の盤面</span>
+          <canvas ref={myCanvasRef} width={216} height={432} className="bg-black border-2 border-green-500 rounded shadow-lg" />
+        </div>
+
+        <div className="flex flex-col gap-2">
+          <span className="text-xs text-gray-400">対戦相手一覧</span>
+          {Object.entries(roomData.players).map(([uid, p]) => {
+            if (uid === user.uid) return null;
+            return (
+              <div key={uid} className="bg-gray-800 p-2 rounded border border-gray-700 flex flex-col items-center">
+                <span className="text-[10px] text-gray-300 mb-1">{p.name}</span>
+                <canvas 
+                  ref={el => otherCanvasRefs.current[uid] = el} 
+                  width={72} 
+                  height={144} 
+                  className="bg-black border border-gray-600 rounded" 
+                />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
